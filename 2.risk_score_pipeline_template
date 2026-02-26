@@ -1,0 +1,359 @@
+# Required packages
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(survival)
+library(broom)
+library(data.table)
+library(fastDummies)
+library(readxl)
+
+# ---------------------------
+# CONFIG (placeholders only)
+# ---------------------------
+
+dat <- completed_df11
+
+# Identifier
+id0 <- "id0"
+
+# Fixed adjustment covariates
+cov_adj <- c("cov1", "cov2", "cov3")
+
+# Age category (optional) + BMI (optional)
+cov_agecat <- "cov4"
+cov_bmi    <- "cov5"
+
+# Event/time columns for one endpoint (example)
+y0 <- "y0"   # event indicator (0/1)
+t0 <- "t0"   # follow-up time (numeric)
+
+# Optional additional endpoints (kept in the "core" table if needed)
+y_list <- c("y1", "y2")
+t_list <- c("t1", "t2")
+
+# Exposure block to be dummy-encoded (columns)
+# NOTE: keep this as a character vector in your local mapping
+x_cols <- paste0("x", 1:10)
+
+# External ExWAS results file (user should provide path)
+exwas_file <- "exwas_results.xlsx"
+
+# FDR threshold
+fdr_thr <- 0.05
+
+# Output files
+out_model1 <- "model1_results.csv"
+out_model2 <- "model2_results.csv"
+out_model3 <- "model3_results.csv"
+
+# ---------------------------
+# Helper functions
+# ---------------------------
+
+# Safer column name sanitizer (keeps separators to reduce collisions)
+sanitize_names <- function(x) {
+  x <- gsub("[[:space:]]+", ".", x)
+  x <- gsub("[^[:alnum:]\\.]+", ".", x)
+  x <- gsub("\\.+", ".", x)
+  x
+}
+
+# Binary categorization for score columns
+# - if only two unique values: split by mean
+# - otherwise: split by median
+binarize_score <- function(vec_num) {
+  x <- as.numeric(vec_num)
+  x_non_na <- x[!is.na(x)]
+  if (length(unique(x_non_na)) <= 2) {
+    cutv <- mean(x_non_na)
+  } else {
+    cutv <- median(x_non_na)
+  }
+  factor(ifelse(x <= cutv, "Favourable", "Unfavourable"),
+         levels = c("Favourable", "Unfavourable"))
+}
+
+# ---------------------------
+# Step A: Build a core table
+# ---------------------------
+
+core_cols <- unique(c(
+  id0, cov_adj, cov_agecat, cov_bmi,
+  y0, t0, y_list, t_list
+))
+
+core <- dat %>%
+  dplyr::select(all_of(core_cols))
+
+# ---------------------------
+# Step B: Dummy-encode exposures
+# ---------------------------
+
+# Ensure exposures exist
+x_cols <- x_cols[x_cols %in% names(dat)]
+
+x_dummy <- fastDummies::dummy_cols(
+  dat[, x_cols, drop = FALSE],
+  remove_first_dummy = TRUE,
+  remove_selected_columns = TRUE
+)
+
+colnames(x_dummy) <- sanitize_names(colnames(x_dummy))
+
+# Attach ID for joining
+x_dummy[[id0]] <- dat[[id0]]
+
+# Merge core + dummies
+work <- core %>%
+  left_join(x_dummy, by = id0)
+
+# ---------------------------
+# Step C: Read ExWAS results and keep significant terms
+# Expected columns in exwas_file:
+#   category, term, HR, FDR_p
+# ---------------------------
+
+exwas_res <- readxl::read_excel(exwas_file)
+
+sig_res <- exwas_res %>%
+  filter(!is.na(FDR_p), FDR_p < fdr_thr) %>%
+  transmute(
+    category = as.character(category),
+    term = as.character(term),
+    weight = log(as.numeric(HR))
+  )
+
+# ---------------------------
+# Step D: Reverse-code protective terms (weight < 0)
+# - flip dummy (1-x) and make weight positive
+# ---------------------------
+
+for (i in which(sig_res$weight < 0)) {
+  nm <- sig_res$term[i]
+  if (nm %in% names(work)) {
+    work[[nm]] <- ifelse(is.na(work[[nm]]), NA, 1 - work[[nm]])
+    sig_res$weight[i] <- -sig_res$weight[i]
+  }
+}
+
+# ---------------------------
+# Step E: Compute domain scores
+# - Score_<category> columns are created
+# - If a category has >1 term, fit a joint Cox model to get within-domain betas
+#   (fallback to independent weights if joint model fails)
+# ---------------------------
+
+risk <- work %>%
+  dplyr::select(all_of(c(id0, cov_adj, cov_agecat)))
+
+cats <- unique(sig_res$category)
+
+for (cc in cats) {
+
+  tmp <- sig_res %>% filter(category == cc)
+  terms <- tmp$term
+  terms <- terms[terms %in% names(work)]
+
+  if (length(terms) == 0) next
+
+  if (length(terms) == 1) {
+    # Single-term domain: score equals the (possibly reverse-coded) dummy itself
+    risk[[paste0("Score_", sanitize_names(cc))]] <- work[[terms]]
+    next
+  }
+
+  # Multi-term domain: attempt joint Cox to get within-domain betas
+  f_joint <- as.formula(
+    paste0(
+      "Surv(", t0, ", ", y0, ") ~ ",
+      paste(c(terms, cov_adj), collapse = " + ")
+    )
+  )
+
+  fit_joint <- tryCatch(coxph(f_joint, data = work), error = function(e) NULL)
+
+  if (!is.null(fit_joint)) {
+    bet <- broom::tidy(fit_joint) %>%
+      filter(term %in% terms) %>%
+      transmute(term, beta = estimate)
+  } else {
+    bet <- tmp %>% transmute(term, beta = weight)
+  }
+
+  # Fill missing betas with independent weights if needed
+  miss <- setdiff(terms, bet$term)
+  if (length(miss) > 0) {
+    bet2 <- tmp %>% filter(term %in% miss) %>% transmute(term, beta = weight)
+    bet <- bind_rows(bet, bet2)
+  }
+
+  sum_beta <- sum(bet$beta, na.rm = TRUE)
+
+  # Weighted average score
+  sc <- rep(0, nrow(work))
+  for (nm in terms) {
+    b <- bet$beta[bet$term == nm][1]
+    sc <- sc + work[[nm]] * b
+  }
+  sc <- if (sum_beta > 0) sc / sum_beta else sc
+
+  risk[[paste0("Score_", sanitize_names(cc))]] <- sc
+}
+
+# ---------------------------
+# Step F: Z-standardize scores in-place
+# ---------------------------
+
+score_cols <- grep("^Score_", names(risk), value = TRUE)
+
+for (nm in score_cols) {
+  m <- mean(risk[[nm]], na.rm = TRUE)
+  s <- sd(risk[[nm]], na.rm = TRUE)
+  risk[[nm]] <- (risk[[nm]] - m) / s
+}
+
+# ---------------------------
+# Step G: Binarize each score into Favourable / Unfavourable
+# ---------------------------
+
+for (nm in score_cols) {
+  risk[[paste0(nm, "_cat")]] <- binarize_score(risk[[nm]])
+}
+
+# ---------------------------
+# Step H: Merge endpoints back if needed
+# ---------------------------
+
+risk_full <- risk %>%
+  left_join(dat %>% dplyr::select(all_of(c(id0, y0, t0))), by = id0)
+
+risk_full <- risk_full
+colnames(risk_full) <- make.names(colnames(risk_full))
+
+# ---------------------------
+# Step I: Domain Cox models
+# Model 1: each domain score_cat + fixed adjustment
+# Model 2: all domain score_cat mutually adjusted + fixed adjustment
+# Model 3: continuous domain scores mutually adjusted + fixed adjustment
+# ---------------------------
+
+fixed_adj_safe <- make.names(cov_adj)
+score_cat_vars <- make.names(paste0(score_cols, "_cat"))
+score_cont_vars <- make.names(score_cols)
+
+risk_full <- risk_full %>%
+  mutate(across(all_of(score_cat_vars), ~ factor(., levels = c("Favourable", "Unfavourable"))))
+
+# Model 1
+model1 <- map_dfr(score_cat_vars, function(vv) {
+
+  f1 <- as.formula(
+    paste0("Surv(", make.names(t0), ", ", make.names(y0), ") ~ ", vv, " + ",
+           paste(fixed_adj_safe, collapse = " + "))
+  )
+
+  fit1 <- coxph(f1, data = risk_full)
+
+  cnt <- risk_full %>%
+    group_by(.data[[vv]]) %>%
+    summarise(
+      Total_no = n(),
+      No_events = sum(.data[[make.names(y0)]] == 1, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    rename(Level = 1) %>%
+    mutate(Variable = vv) %>%
+    dplyr::select(Variable, Level, everything())
+
+  td <- tidy(fit1, conf.int = TRUE, exponentiate = TRUE) %>%
+    filter(grepl(paste0("^", vv), term))
+
+  hr_tbl <- tibble(
+    Level = levels(risk_full[[vv]])[-1],
+    HR = td$estimate,
+    CI_lower = td$conf.low,
+    CI_upper = td$conf.high,
+    P_value = td$p.value
+  )
+
+  ref <- tibble(Level = "Favourable", HR = 1, CI_lower = NA, CI_upper = NA, P_value = NA)
+
+  left_join(cnt, bind_rows(ref, hr_tbl), by = "Level") %>%
+    mutate(
+      `HR_95CI` = if_else(Level == "Favourable",
+                         "1 (reference)",
+                         sprintf("%.2f (%.2f-%.2f)", HR, CI_lower, CI_upper))
+    ) %>%
+    dplyr::select(Variable, Level, Total_no, No_events, HR_95CI, P_value)
+})
+
+fwrite(model1, out_model1)
+
+# Model 2
+f2 <- as.formula(
+  paste0("Surv(", make.names(t0), ", ", make.names(y0), ") ~ ",
+         paste(score_cat_vars, collapse = " + "), " + ",
+         paste(fixed_adj_safe, collapse = " + "))
+)
+
+fit2 <- coxph(f2, data = risk_full)
+
+model2 <- map_dfr(score_cat_vars, function(vv) {
+
+  cnt <- risk_full %>%
+    group_by(.data[[vv]]) %>%
+    summarise(
+      Total_no = n(),
+      No_events = sum(.data[[make.names(y0)]] == 1, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    rename(Level = 1) %>%
+    mutate(Variable = vv) %>%
+    dplyr::select(Variable, Level, everything())
+
+  td <- tidy(fit2, conf.int = TRUE, exponentiate = TRUE) %>%
+    filter(grepl(paste0("^", vv), term))
+
+  hr_tbl <- tibble(
+    Level = levels(risk_full[[vv]])[-1],
+    HR = td$estimate,
+    CI_lower = td$conf.low,
+    CI_upper = td$conf.high,
+    P_value = td$p.value
+  )
+
+  ref <- tibble(Level = "Favourable", HR = 1, CI_lower = NA, CI_upper = NA, P_value = NA)
+
+  left_join(cnt, bind_rows(ref, hr_tbl), by = "Level") %>%
+    mutate(
+      `HR_95CI` = if_else(Level == "Favourable",
+                         "1 (reference)",
+                         sprintf("%.2f (%.2f-%.2f)", HR, CI_lower, CI_upper))
+    ) %>%
+    dplyr::select(Variable, Level, Total_no, No_events, HR_95CI, P_value)
+})
+
+fwrite(model2, out_model2)
+
+# Model 3
+f3 <- as.formula(
+  paste0("Surv(", make.names(t0), ", ", make.names(y0), ") ~ ",
+         paste(score_cont_vars, collapse = " + "), " + ",
+         paste(fixed_adj_safe, collapse = " + "))
+)
+
+fit3 <- coxph(f3, data = risk_full)
+
+model3 <- tidy(fit3, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term %in% score_cont_vars) %>%
+  transmute(
+    Variable = term,
+    HR = estimate,
+    CI_lower = conf.low,
+    CI_upper = conf.high,
+    P_value = p.value,
+    HR_95CI = sprintf("%.2f (%.2f-%.2f)", HR, CI_lower, CI_upper)
+  )
+
+fwrite(model3, out_model3)
