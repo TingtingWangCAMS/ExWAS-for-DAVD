@@ -1,0 +1,102 @@
+# Required packages
+library(survival)
+library(broom)
+library(dplyr)
+
+# ---------------------------
+# Data and model definitions
+# ---------------------------
+
+dat <- completed_df11
+
+# a, b, c: fixed adjustment covariates (e.g., sex, age, center)
+adj_covars <- c("a", "b", "c")
+
+# y: event indicator (0/1)
+# t: follow-up time (numeric, >0)
+y <- "y"
+t <- "t"
+
+# x: exposure variable to test (can be multi-level factor)
+x <- "x"
+
+# Utility: escape regex metacharacters in variable names
+regex_escape <- function(s) gsub("([][{}()+*^$|\\\\.?])", "\\\\\\1", s)
+
+# ---------------------------
+# Fit base Cox model
+# ---------------------------
+
+f_base <- as.formula(
+  paste0("Surv(", t, ", ", y, ") ~ ", x, " + ", paste(adj_covars, collapse = " + "))
+)
+
+fit <- coxph(f_base, data = dat)
+
+# ---------------------------
+# Proportional hazards (PH) test for the exposure only
+# ---------------------------
+
+zph <- try(cox.zph(fit), silent = TRUE)
+violate <- FALSE
+
+if (!inherits(zph, "try-error")) {
+  ztab <- zph$table
+
+  # Remove the GLOBAL row if present
+  if ("GLOBAL" %in% rownames(ztab)) {
+    ztab <- ztab[setdiff(rownames(ztab), "GLOBAL"), , drop = FALSE]
+  }
+
+  # Identify rows related to the exposure:
+  # - For numeric exposure: rowname == x
+  # - For multi-level factor exposure: rownames often start with x (e.g., x=Level, x2, etc.)
+  rx <- paste0("^", regex_escape(x))
+  exposure_rows <- grepl(rx, rownames(ztab))
+
+  # If we can find exposure-related rows, test them; otherwise fall back to no violation
+  if (any(exposure_rows)) {
+    pvals <- ztab[exposure_rows, "p"]
+    pvals <- as.numeric(pvals)
+    violate <- any(!is.na(pvals) & pvals < 1e-4)
+  } else {
+    violate <- FALSE
+  }
+}
+
+# ---------------------------
+# If PH is violated for exposure, add time-varying effect (x * log(time))
+# ---------------------------
+
+if (violate) {
+  dat$logt <- log(dat[[t]] + 0.1)  # avoid log(0)
+
+  f_tv <- as.formula(
+    paste0(
+      "Surv(", t, ", ", y, ") ~ ",
+      x, " + logt + ", x, ":logt + ",
+      paste(adj_covars, collapse = " + ")
+    )
+  )
+
+  fit <- coxph(f_tv, data = dat)
+}
+
+# ---------------------------
+# Output results for exposure terms only
+# ---------------------------
+
+rx_term <- paste0("^", regex_escape(x))
+res <- tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(grepl(rx_term, term)) %>%
+  transmute(
+    model = ifelse(violate, "cox_time_varying", "cox_standard"),
+    exposure = x,
+    term,
+    HR = estimate,
+    CI_lower = conf.low,
+    CI_upper = conf.high,
+    p_value = p.value
+  )
+
+print(res)
